@@ -3040,6 +3040,21 @@ alter_table_cmd:
 					n->def = (Node *) $1;
 					$$ = (Node *) n;
 				}
+			/* ALTER TABLE <name> SPLIT INTO <iconst> */
+			| SPLIT INTO Iconst
+				{
+					AlterTableCmd *n = makeNode(AlterTableCmd);
+
+					if ($3 <= 0 || $3 > PG_INT16_MAX)
+							ereport(ERROR,
+									(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+									errmsg("column number must be in range from 1 to %d", PG_INT16_MAX),
+									parser_errposition(@3)));
+
+					n->subtype = AT_SplitInto;
+					n->split = (int16) $3;
+					$$ = (Node *) n;
+				}
 		;
 
 alter_column_default:

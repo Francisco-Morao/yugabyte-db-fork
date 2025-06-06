@@ -504,6 +504,29 @@ public class TestPgAlterTable extends BasePgSQLTest {
     }
   }
 
+  @Test
+  public void testAlterTableSplit() throws Exception {
+    try (Statement statement = connection.createStatement()) {
+      statement.execute("CREATE TABLE split_test (id SERIAL PRIMARY KEY, name TEXT);");
+      statement.execute("INSERT INTO split_test (name) VALUES ('one'), ('two'), ('three');");
+
+      runInvalidQuery(statement, "ALTER TABLE split_test SPLIT INTO ;", "syntax error");
+
+      runInvalidQuery(statement, "ALTER TABLE split_test SPLIT INTO 1;", "SPLIT INTO value must be at least 2");
+
+      runInvalidQuery(statement, "ALTER TABLE split_test SPLIT INTO 4;", "cannot SPLIT INTO 4 parts: row count (3) is too low");
+
+      statement.execute("ALTER TABLE split_test SPLIT INTO 2;");
+
+      // Original table is dropped.
+      runInvalidQuery(statement, "SELECT * FROM split_test;", "does not exist");
+
+      statement.execute("SELECT * FROM split_test1;");
+
+      statement.execute("SELECT * FROM split_test2;");
+    }
+  }
+
   private static String selectAttributesQuery(String table) {
     return String.format(
         "SELECT a.attname, t.typname FROM pg_attribute a" +

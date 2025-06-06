@@ -4618,3 +4618,78 @@ drop publication pub1;
 drop schema alter1 cascade;
 drop schema alter2 cascade;
 NOTICE:  drop cascades to table alter2.t1
+-- Test that ALTER TABLE ... SLIT INTO works without primary key
+create table split_into (a int, b int);
+alter table split_into split into 1; -- fail
+ERROR:  SPLIT INTO value must be at least 2
+alter table split_into split into 3; -- fail
+ERROR:  cannot SPLIT INTO 3 parts: row count (0) is too low
+insert into split_into values (1, 2), (3, 4), (5, 6), (7, 8);
+alter table split_into split into 3;
+select * from split_into;
+ERROR:  relation "split_into" does not exist
+select * from split_into1;
+ a | b 
+---+---
+ 5 | 6
+(1 row)
+select * from split_into2;
+ a | b 
+---+---
+ 7 | 8
+ 3 | 4
+ 1 | 2
+(3 rows)
+select * from split_into3;
+ a | b  
+---+----
+ 9 | 10
+(1 row)
+drop table split_into1, split_into2, split_into3;
+-- Test that ALTER TABLE ... SLIT INTO works with primary key
+create table split_into_pk (a int primary key, b int);
+insert into split_into_pk values (1, 2), (3, 4), (5, 6), (7, 8), (9, 10);
+alter table split_into_pk split into 3;
+select * from split_into_pk1;
+ a | b 
+---+---
+ 5 | 6
+ 3 | 4
+(2 rows)
+select * from split_into_pk2;
+ a | b  
+---+----
+ 9 | 10
+(1 row)
+select * from split_into_pk3;
+ a | b 
+---+---
+ 7 | 8
+ 1 | 2
+(2 rows)
+drop table split_into_pk1, split_into_pk2, split_into_pk3;
+-- Test that ALTER TABLE ... SLIT INTO works with foreign key
+create table split_into (a int primary key, b int);
+create table split_into_fk (a int primary key, split_into_fk int references split_into(a), b int);
+insert into split_into values (1, 2), (3, 4);
+insert into split_into_fk values (5, 1, 3), (6, 3, 5), (7, 1, 7), (9, 1, 9), (10, 3, 11);
+alter table split_into_fk split into 3;
+select * from split_into_fk1;
+ a  | split_into_fk | b  
+----+---------------+----
+ 10 |             3 | 11
+  6 |             3 |  5
+  5 |             1 |  3
+(3 rows)
+select * from split_into_fk2;
+ a | split_into_fk | b 
+---+---------------+---
+ 9 |             1 | 9
+(1 row)
+select * from split_into_fk3;
+ a | split_into_fk | b 
+---+---------------+---
+ 7 |             1 | 7
+(1 row)
+drop table split_into_fk1, split_into_fk2;
+drop table split_into CASCADE;

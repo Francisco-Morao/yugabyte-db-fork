@@ -3036,3 +3036,33 @@ alter table alter1.t1 set schema alter2;
 drop publication pub1;
 drop schema alter1 cascade;
 drop schema alter2 cascade;
+-- Test that ALTER TABLE ... SLIT INTO works without primary key
+create table split_into (a int, b int);
+alter table split_into split into 1; -- fail
+alter table split_into split into 3; -- fail
+insert into split_into values (1, 2), (3, 4), (5, 6), (7, 8), (9, 10);
+alter table split_into split into 3;
+select * from split_into;
+select * from split_into1;
+select * from split_into2;
+select * from split_into3;
+drop table split_into1, split_into2, split_into3;
+-- Test that ALTER TABLE ... SLIT INTO works with primary key
+create table split_into_pk (a int primary key, b int);
+insert into split_into_pk values (1, 2), (3, 4), (5, 6), (7, 8), (9, 10);
+alter table split_into_pk split into 3;
+select * from split_into_pk1;
+select * from split_into_pk2;
+select * from split_into_pk3;
+drop table split_into_pk1, split_into_pk2, split_into_pk3;
+-- Test that ALTER TABLE ... SLIT INTO works with foreign key
+create table split_into (a int primary key, b int);
+create table split_into_fk (a int primary key, split_into_fk int references split_into(a), b int);
+insert into split_into values (1, 2), (3, 4);
+insert into split_into_fk values (5, 1, 3), (6, 3, 5), (7, 1, 7), (9, 1, 9), (10, 3, 11);
+alter table split_into_fk split into 3;
+select * from split_into_fk1;
+select * from split_into_fk2;
+select * from split_into_fk3;
+drop table split_into_fk1, split_into_fk2, split_into_fk3;
+drop table split_into CASCADE;

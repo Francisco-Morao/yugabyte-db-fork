@@ -1770,6 +1770,9 @@ YBCPrepareAlterTableCmd(AlterTableCmd *cmd, Relation rel, List *handles,
 		case AT_DropOf:
 			*needsYBAlter = false;
 			break;
+		case AT_SplitInto:
+			*needsYBAlter = false;
+			break;
 
 		default:
 			ereport(ERROR,

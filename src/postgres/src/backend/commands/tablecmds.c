@@ -78,7 +78,9 @@
 #include "commands/trigger.h"
 #include "commands/typecmds.h"
 #include "commands/user.h"
+#include "common/hashfn.h"
 #include "executor/executor.h"
+#include "executor/spi.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
@@ -646,6 +648,14 @@ static void ATExecSetRowSecurity(Relation rel, bool rls);
 static void ATExecForceNoForceRowSecurity(Relation rel, bool force_rls);
 static ObjectAddress ATExecSetCompression(AlteredTableInfo *tab, Relation rel,
 										  const char *column, Node *newValue, LOCKMODE lockmode);
+
+static void ATExecSplitInto(Relation rel, AttrNumber num_splits, LOCKMODE lockmode);
+static void YBCSplitTableInto(Oid relid, AttrNumber num_splits);
+static ObjectAddress CreateSplitTable(Relation orig_rel, const char *new_relname, const char *nspname);
+static void YBCDistributeRows(Relation src, Relation *targets, int num_splits);
+static Oid get_primary_key_index(Oid relid, Relation rel);
+static AttrNumber get_primary_key_attnum(Relation rel);
+static uint32 CalculateRowHash(TupleTableSlot *slot);
 
 static void index_copy_data(Relation rel, RelFileNode newrnode);
 static const char *storage_name(char c);
@@ -4730,6 +4740,9 @@ AlterTableGetLockLevel(List *cmds)
 				 */
 				cmd_lockmode = AccessShareLock;
 				break;
+			case AT_SplitInto:
+				cmd_lockmode = AccessExclusiveLock;
+				break;
 
 			default:			/* oops */
 				elog(ERROR, "unrecognized alter table type: %d",
@@ -5207,6 +5220,11 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 			ATSimplePermissions(cmd->subtype, rel, ATT_TABLE);
 			/* No command-specific prep needed */
 			pass = AT_PASS_MISC;
+			break;
+		case AT_SplitInto:
+			ATSimplePermissions(cmd->subtype, rel, ATT_TABLE);
+			/* No command-specific prep needed */
+			pass = AT_PASS_DROP;
 			break;
 		default:				/* oops */
 			elog(ERROR, "unrecognized alter table type: %d",
@@ -5767,6 +5785,12 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab,
 		case AT_DetachPartitionFinalize:
 			ATExecDetachPartitionFinalize(rel, ((PartitionCmd *) cmd->def)->name);
 			break;
+		case AT_SplitInto:
+			ATExecSplitInto(rel, cmd->split, lockmode);
+			/* ATExecSplitInto closes the relation so we must not use it again */
+			tab->rel = NULL;
+			tab->relid = InvalidOid;
+			break;
 		default:				/* oops */
 			elog(ERROR, "unrecognized alter table type: %d",
 				 (int) cmd->subtype);
@@ -5945,6 +5969,8 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 	{
 		AlteredTableInfo *tab = (AlteredTableInfo *) lfirst(ltab);
 
+		if (tab->relid == InvalidOid)
+			continue;
 		/*
 		 * Relations without storage may be ignored here.
 		 * Foreign tables have no storage, nor do partitioned tables and indexes.
@@ -6214,6 +6240,8 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 		Relation	rel = NULL;
 		ListCell   *lcon;
 
+		if (tab->relid == InvalidOid)
+			continue;
 		/*
 		 * Relations without storage may be ignored here too.
 		 * YB: We can also ignore YB relations during upgrade because their
@@ -6842,6 +6870,8 @@ alter_table_type_to_string(AlterTableType cmdtype)
 			return "ALTER COLUMN ... DROP IDENTITY";
 		case AT_ReAddStatistics:
 			return NULL;		/* not real grammar */
+		case AT_SplitInto:
+			return "ALTER TABLE ... SPLIT INTO ... ";
 	}
 
 	return NULL;
@@ -22972,4 +23002,350 @@ YbATInvalidateTableCacheAfterAlter(List *ybAlteredTableIds)
 			RelationClose(rel);
 		}
 	}
+}
+
+/*
+ * ALTER TABLE SPLIT INTO
+ * This function validates the split request then invokes YBCSplitTableInto()
+ * to perform the data redistribution.
+ * After a successful split, the original table is dropped.
+ */
+static void
+ATExecSplitInto(Relation rel, AttrNumber num_splits, LOCKMODE lockmode)
+{
+	float4 reltuples;
+	Form_pg_class classForm;
+	Oid opclassoid;
+	HeapTuple classtup;
+	const char *relname, *namespace_name;
+	Oid nspoid;
+
+	/* Validate split count */
+	if (num_splits < 2)
+		ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("SPLIT INTO value must be at least 2")));
+
+	/* Ensure it is a regular heap table. Extent to other tables in the future */
+	if (rel->rd_rel->relkind != RELKIND_RELATION)
+		 ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("SPLIT INTO is only supported on regular tables")));
+
+	opclassoid = RelationGetRelid(rel);
+	classtup = SearchSysCache1(RELOID, ObjectIdGetDatum(opclassoid));
+	if (!HeapTupleIsValid(classtup))
+		elog(ERROR, "cache lookup failed for operator class %u", opclassoid);
+
+	classForm = (Form_pg_class) GETSTRUCT(classtup);
+
+	/* Estimate the number of rows in the table. */
+	if (classForm->reltuples < 0)
+	{
+		reltuples = 0;
+		TableScanDesc scan = table_beginscan_catalog(rel, 0, NULL);
+		HeapTuple tuple;
+
+		while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+			reltuples++;
+		table_endscan(scan);
+	}
+	else
+		reltuples = classForm->reltuples;
+
+	ReleaseSysCache(classtup);
+
+	/* Ensure we have enough rows to justify the requested number of splits. */
+	if (reltuples < num_splits)
+		ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("cannot SPLIT INTO %d parts: row count (%.0f) is too low",
+						num_splits, reltuples)));
+
+	/* Perform the split. This redistributes data into new tables. */
+	YBCSplitTableInto(opclassoid, num_splits);
+
+	relation_close(rel, lockmode);
+
+	CommandCounterIncrement();
+
+	/* Drop the original table */
+	relname = RelationGetRelationName(rel);
+	nspoid = RelationGetNamespace(rel);
+	namespace_name = get_namespace_name(nspoid);
+
+	YbATDropTable(namespace_name, relname);
+}
+
+/*
+ * Used in YugabyteDB to logically split a single table into n new tables.
+ * Each split table is created with the same format as the original, and
+ * rows are redistributed among the new tables based on a hash
+ */
+void
+YBCSplitTableInto(Oid relid, AttrNumber num_splits)
+{
+	Relation rel;
+	Oid nspoid;
+	const char *relname, *nspname;
+	Oid *new_relids;
+	Relation *new_rels;
+
+	rel = relation_open(relid, AccessExclusiveLock);
+	relname = RelationGetRelationName(rel);
+	nspoid = RelationGetNamespace(rel);
+	nspname = get_namespace_name(nspoid);
+	new_relids = palloc(sizeof(Oid) * num_splits);
+	new_rels = palloc(sizeof(Relation) * num_splits);
+
+	for (int i = 0; i < num_splits; i++)
+	{
+		/* Create new table and open relation to later populate it */
+		char *new_relname = psprintf("%s%d", relname, i + 1);
+		ObjectAddress addr = CreateSplitTable(rel, new_relname, nspname);
+		new_relids[i] = addr.objectId;
+		new_rels[i] = relation_open(addr.objectId, RowExclusiveLock);
+	}
+
+	/* Populate different tables */
+	YBCDistributeRows(rel, new_rels, num_splits);
+
+	/* Close all tables */
+	for (int i = 0; i < num_splits; i++){
+		relation_close(new_rels[i], RowExclusiveLock);
+	}
+
+	relation_close(rel, AccessExclusiveLock);
+}
+
+/*
+ * Create a new table by cloning the column definitions of an existing
+ * table. The new table is not populated with any data. It is a simply
+ * structural duplicate.
+ */
+ObjectAddress
+CreateSplitTable(Relation old_rel, const char *new_relname, const char *nspname)
+{
+	CreateStmt *stmt;
+	TupleDesc tupdesc;
+	ObjectAddress addr;
+
+	/* Allocate and initialize a CreateStmt node for table creation. */
+	stmt = makeNode(CreateStmt);
+	stmt->relation = makeRangeVar(pstrdup(nspname),
+								pstrdup(new_relname),
+								-1 /* location */ );
+	stmt->oncommit = ONCOMMIT_NOOP;
+	stmt->if_not_exists = false;
+
+	/*
+	 * Clone column definitions from the old relation.
+	 * For each column, we construct a ColumnDef node that defines
+	 * the column name, type, collation, and constraints.
+	*/
+	tupdesc = RelationGetDescr(old_rel);
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr_form = TupleDescAttr(tupdesc, i);
+		if (attr_form->attisdropped)
+			continue;
+
+		ColumnDef *coldef = makeNode(ColumnDef);
+		coldef->colname = pstrdup(NameStr(attr_form->attname));
+		coldef->typeName = makeTypeNameFromOid(attr_form->atttypid,
+											   attr_form->atttypmod);
+		stmt->tablespacename = get_tablespace_name(old_rel->rd_rel->reltablespace);
+		coldef->inhcount = 0;
+		coldef->is_local = true;
+		coldef->is_not_null = attr_form->attnotnull;
+		coldef->is_from_type = false;
+		coldef->storage = 0;
+		coldef->collOid = attr_form->attcollation;
+		coldef->location = -1;
+
+		stmt->tableElts = lappend(stmt->tableElts, coldef);
+	}
+	/* Create the relation using the standard catalog definition path */
+	addr = DefineRelation(stmt, RELKIND_RELATION,
+						old_rel->rd_rel->relowner,
+						NULL,
+						NULL);
+	return addr;
+}
+
+/*
+ * Distribute rows from the given relation into a set of target relations.
+ * The target is chosen based on a hash of the primary key if available,
+ * otherwise a general row hash is used.
+ */
+void
+YBCDistributeRows(Relation rel, Relation *targets, int num_targets)
+{
+	EState *estate;
+	ResultRelInfo *result_rels;
+	AttrNumber pk_attnum;
+	bool use_pk;
+	TupleTableSlot *slot;
+	TableScanDesc scan;
+	HeapTuple tuple;
+
+	estate = CreateExecutorState();
+	estate->es_output_cid = GetCurrentCommandId(true);
+
+	/* Initialize every target relation*/
+	result_rels = palloc0(sizeof(ResultRelInfo) * num_targets);
+	for (int i = 0; i < num_targets; i++)
+	{
+		InitResultRelInfo(&result_rels[i], targets[i], 1, NULL, 0);
+		ExecOpenIndices(&result_rels[i], false);
+	}
+
+	/*
+	 * Determine if we can use a primary key for hashing.
+	 * When distributing rows across multiple targets, using the primary key
+	 * ensures stable and deterministic distribution.
+	 * If a primary key exists, we hash its value to select the target.
+	 * Otherwise, we compute a general hash over the entire row,
+	 * which is less efficient.
+	 */
+	pk_attnum = get_primary_key_attnum(rel);
+	use_pk = (pk_attnum != InvalidAttrNumber);
+
+	slot = table_slot_create(rel, NULL);
+	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
+
+	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		ExecStoreHeapTuple(tuple, slot, false);
+
+		uint32 hash;
+		if (use_pk)
+		{
+			bool isnull;
+			Datum val = slot_getattr(slot, pk_attnum, &isnull);
+			if (isnull)
+				continue;
+
+			Datum text_val = val;
+			Oid typid = slot->tts_tupleDescriptor->attrs[pk_attnum - 1].atttypid;
+
+			/* Convert non-text primary key values to text for hashing. */
+			if (typid != TEXTOID)
+			{
+				Oid typoutput;
+				bool typIsVarlena;
+
+				getTypeOutputInfo(typid, &typoutput, &typIsVarlena);
+				char *valstr = OidOutputFunctionCall(typoutput, val);
+				text_val = CStringGetTextDatum(valstr);
+				pfree(valstr);
+			}
+			/* Calculate hash of the representation of the primary key*/
+			hash = DatumGetUInt32(hash_any(
+				(unsigned char *) VARDATA(DatumGetTextPP(text_val)),
+				VARSIZE_ANY_EXHDR(DatumGetTextPP(text_val))));
+		}
+		else
+			hash = CalculateRowHash(slot);
+
+		/* Choose the target relation and insert the tuple. */
+		int target_idx = hash % num_targets;
+		YBCExecuteInsert(targets[target_idx], slot, ONCONFLICT_NONE);
+	}
+
+	/* Cleanup everything */
+	table_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
+
+	ExecResetTupleTable(estate->es_tupleTable, false);
+
+	for (int i = 0; i < num_targets; i++)
+		ExecCloseIndices(&result_rels[i]);
+
+	FreeExecutorState(estate);
+}
+
+/*
+ * Get the attribute number of the primary key column for a relation.
+ */
+static AttrNumber
+get_primary_key_attnum(Relation rel)
+{
+	Oid pk_oid;
+	HeapTuple indexTuple;
+	Form_pg_index index;
+	AttrNumber attnum;
+
+	pk_oid = get_primary_key_index(RelationGetRelid(rel), rel);
+	if (!OidIsValid(pk_oid))
+		return InvalidAttrNumber;
+
+	indexTuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(pk_oid));
+	if (!HeapTupleIsValid(indexTuple))
+		elog(ERROR, "cache lookup failed for index %u", pk_oid);
+
+	index = (Form_pg_index) GETSTRUCT(indexTuple);
+
+	attnum = index->indkey.values[0];
+
+	ReleaseSysCache(indexTuple);
+
+	return attnum;
+}
+
+/*
+ * Get the OID of the primary key index for a table.
+ */
+Oid
+get_primary_key_index(Oid relid, Relation rel)
+{
+	List *indexlist = RelationGetIndexList(rel);
+	ListCell *lc;
+
+	foreach(lc, indexlist)
+	{
+		Oid index_oid = lfirst_oid(lc);
+		if (index_oid == rel->rd_pkindex)
+		{
+			list_free(indexlist);
+			return index_oid;
+		}
+	}
+	list_free(indexlist);
+	return InvalidOid;
+}
+
+/*
+ * Calculate a hash for a row in a tuple table slot without primary key.
+ */
+uint32 CalculateRowHash(TupleTableSlot *slot)
+{
+	uint32 hash;
+	StringInfoData buf;
+	initStringInfo(&buf);
+
+	for (int i = 0; i < slot->tts_tupleDescriptor->natts; i++)
+	{
+		bool isnull;
+		Datum val = slot_getattr(slot, i + 1, &isnull);
+
+		if (isnull)
+			appendStringInfoString(&buf, "NULL|");
+
+		else
+		{
+			Oid typoutput;
+			bool typIsVarlena;
+			getTypeOutputInfo(slot->tts_tupleDescriptor->attrs[i].atttypid,
+							&typoutput,
+							&typIsVarlena);
+			char *valstr = OidOutputFunctionCall(typoutput, val);
+			appendStringInfo(&buf, "%s|", valstr);
+			pfree(valstr);
+		}
+	}
+
+	hash = DatumGetUInt32(hash_any((const unsigned char *) buf.data, buf.len));
+
+	return hash;
 }

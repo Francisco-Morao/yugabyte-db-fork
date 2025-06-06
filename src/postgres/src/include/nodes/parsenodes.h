@@ -2011,7 +2011,8 @@ typedef enum AlterTableType
 	AT_AddIdentity,				/* ADD IDENTITY */
 	AT_SetIdentity,				/* SET identity column options */
 	AT_DropIdentity,			/* DROP IDENTITY */
-	AT_ReAddStatistics			/* internal to commands/tablecmds.c */
+	AT_ReAddStatistics,			/* internal to commands/tablecmds.c */
+	AT_SplitInto				/* Split Table into many*/
 } AlterTableType;
 
 typedef struct ReplicaIdentityStmt
@@ -2029,6 +2030,8 @@ typedef struct AlterTableCmd	/* one subcommand of an ALTER TABLE */
 								 * or tablespace */
 	int16		num;			/* attribute number for columns referenced by
 								 * number */
+	int16 		split;			 /*atribute number of tables that the original table
+								will be split into*/
 	RoleSpec   *newowner;
 	Node	   *def;			/* definition of new column, index,
 								 * constraint, or parent table */
